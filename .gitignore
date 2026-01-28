@@ -1,0 +1,57 @@
+# .gitignore
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node / npm / yarn / pnpm
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+*.tgz
+
+# Env / secrets (DO NOT COMMIT)
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# Build / output
+dist/
+build/
+out/
+coverage/
+.nyc_output/
+*.log
+
+# Cloudflare Workers / Wrangler
+.wrangler/
+.wranger/   # common typo
+wrangler.toml.bak
+.dev.vars
+.dev.vars.*
+
+# Local test artifacts
+results/
+tmp/
+temp/
+*.sqlite
+*.db
+
+# Archives
+*.zip
+*.tar
+*.tar.gz
+*.7z
