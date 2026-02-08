@@ -1,7 +1,7 @@
 ## Open Science Artifacts
 
 This repository contains the anonymized reference implementation that accompanies the paper.  
-It is intended to help reviewers reproduce the paper�s core mechanisms and to serve as a compact, readable starting point for further experimentation.
+It is intended to help reviewers reproduce the paper's core mechanisms and to serve as a compact, readable starting point for further experimentation.
 
 The artifacts include:
 
