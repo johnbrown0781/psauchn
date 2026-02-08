@@ -1,14 +1,11 @@
-
-
-
-// requests can have authentication provided in request header, or as request url parameter
+// Requests can provide authentication in an HTTP header or as a URL parameter.
 const REQUEST_HEADER = "unattended-client-auth";
 const REQUEST_PARAM_KEY = "uca";
 
 // -------------------------------------------------------------------------------------------------
 const EdgeState = {
 
-    timeByteToleranceSec: 60, // allow timestamps that are +-60 seconds
+    timeByteToleranceSec: 60, // Allow timestamps that are +-60 seconds
 
     signingKeyMap: new Map([
         ['aC7', 'MCowBQYDK2VwAyEA+lBGpE5ifG9y1hC0004mk892AGgFdHk2/sphvRFOzaQ='],
@@ -26,15 +23,15 @@ const EdgeState = {
         //...
     ]),
 
-    extremelyLimitedClientTypes: new Set([
+    highlyConstrainedClientTypes: new Set([
         'atmega3',
         'atmega4',
         //...
     ]),
 
-    authEdgeSalt: '8ra69A_~8Q7g0hRI',
+    backendDerivationKey: "jfGed&l9$6*%rf5_",
 
-    skippedUrl: '/provision', // allow provisioning requests
+    skippedUrl: '/provision', // Allow provisioning requests
 
 };
 
@@ -55,19 +52,25 @@ const UserFacingMessage = {
     INVALID_CLIENT_SIGNATURE: "Invalid signature.",
 }
 
-// attach function that verifies authentication header
+// Attach our function that verifies authentication header.
 addEventListener("fetch", event => event.respondWith(verifyAuthenticationHeader(event.request)));
 
+/**
+ * Edge entry point: validates the authentication header and either:
+ *   - forwards the request to the origin (fetch(request)), or
+ *   - rejects it with a user-facing JSON response.
+ * Note:
+ *   - Cloudflare Workers run on the Web Crypto API, not Node.js crypto.
+ *   - We avoid micro-optimizations here to keep the verifier clean and portable.* 
+ */
 async function verifyAuthenticationHeader(request) {
 
-    // Note: We avoided low-level speed optimizations in order to keep code clean and easily portable.
-
-    // Before Edge Function runs, two limits are enforced by WAF:
+    // Before the edge function runs, two limits are enforced by the WAF:
     // 1) rate-limit per IP
-    // 2) rate-limit per DeviceID
-    //     To enforce rate-limit per DeviceID, using WAF static rules, enforce rate-limit per JWT's payload.
+    // 2) rate-limit per ClientID
+    //     To enforce rate limits per ClientID using static WAF rules, rate-limit on the JWT payload.
     //         Extract JWT's payload from Authentication Header using regex: ^[^~]+~[^.]+\.([^\.]+)\.[^~]+
-    //             details: ^[^~]+~ — the freshness part, [^.]+ — JWT header, \. — literal dot
+    //             Details: ^[^~]+~ — the freshness part, [^.]+ — JWT header, \. — literal dot
     //                      ([^\.]+) — capture group #1: the payload (middle part),  \. — literal dot, [^~]+ — JWT signature, etc.
 
     try {
@@ -77,12 +80,14 @@ async function verifyAuthenticationHeader(request) {
         if (url.pathname === EdgeState.skippedUrl)
             return fetch(request); // forward request to backend
 
-        // get Authentication from HTTP header, or from URL parameter.
+        // Get Authentication from HTTP header, or from URL parameter.
         const authHeader = request.headers.get(REQUEST_HEADER)?.trim() || 
                            url.searchParams.get(REQUEST_PARAM_KEY);
         if (!authHeader)
             throw new Error(UserFacingMessage.MISSING_AUTH);
 
+        // Authentication header format:
+        //   base64url(AuthHash||TimeByte) ~ JWT ~ Signature
         const authHeaderParts = authHeader.split('~');
         if (authHeaderParts.length < 2 || authHeaderParts.length > 3)
             throw new Error(UserFacingMessage.MALFORMED_AUTH);
@@ -106,32 +111,38 @@ async function verifyAuthenticationHeader(request) {
             || typeof keyId !== "string" || !keyId.length)
             throw new Error(UserFacingMessage.INVALID_JWT_PAYLOAD);
 
-        const isHighlyConstrainedClient = EdgeState.extremelyLimitedClientTypes.has(clientType);
+        // Some clients cannot compute Ed25519 signatures (e.g., very small MCUs).
+        // For those, only the keyed AuthHash is required.
+        const isHighlyConstrainedClient = EdgeState.highlyConstrainedClientTypes.has(clientType);
         if (! isHighlyConstrainedClient && ! signatureIfAny)
             throw new Error(UserFacingMessage.MISSING_SIGNATURE);
 
+        // Block misbehaving or abusive clients
         if (EdgeState.blockedClientIds.has(clientId))
             throw new Error(UserFacingMessage.BLOCKED_CLIENT);
 
-        // Decode the 33-byte binary prefix
+        // Decode the 33-byte binary prefix: AuthHash(32) || TimeByte(1)
         const authPrefixRaw_33Bytes = decodeBase64urlToUint8Array(authPrefix);
         if (authPrefixRaw_33Bytes.length !== 33)
             throw new Error(UserFacingMessage.INVALID_PREFIX_LENGTH);
         const authHash = authPrefixRaw_33Bytes.slice(0, 32);
         const timeByte = authPrefixRaw_33Bytes[32];
 
-        // Reconstruct candidate timestamps
+        // Reconstruct candidate timestamps consistent with TimeByte, within a small tolerance window.
+        // We only need to consider near timestamps, and offsets of +-256 seconds cover wrap-around of the low byte.
         const now = Math.floor(Date.now() / 1000);
         const candidateTimestamps = [now, now - 256, now + 256]
             .map(base => base - (base % 256) + timeByte)
             .filter(timestamp => Math.abs(timestamp - now) < EdgeState.timeByteToleranceSec);
+             // For small tolerance there will be just one valid candidate.
         if (candidateTimestamps.length == 0)
             throw new Error(UserFacingMessage.INVALID_TIMEBYTE);
 
-        // Find timestamp whose hash matches
+        // Find a timestamp whose recomputed AuthHash matches the received AuthHash.
         let match = false;
         for (const timestamp of candidateTimestamps) {
-            const computed = await computeAuthHash(jwt, request.clone(), timestamp); // clone() is required to avoid reading body twice
+            // clone() is required to avoid reading the body twice.
+            const computed = await computeAuthHash(clientId, jwt, request.clone(), timestamp); // clone() is required to avoid reading the body twice
             if (isEqualBytes(computed, authHash)) {
                 match = true;
                 break;
@@ -140,7 +151,8 @@ async function verifyAuthenticationHeader(request) {
         if (!match) // hash or timestamp mismatch
             throw new Error(UserFacingMessage.INVALID_PREFIX_VALUE);
 
-        // Load JWT public key
+        // Load JWT signing public key by KeyID.
+        // Block if KeyID is missing, revoked, or unknown.
         const pubJwtSigningKey = EdgeState.signingKeyMap.get(keyId);
         if (! pubJwtSigningKey) {
             const message = EdgeState.revokedKeyMessageMap.get(keyId);
@@ -149,13 +161,13 @@ async function verifyAuthenticationHeader(request) {
             throw new Error(UserFacingMessage.INVALID_JWT_PAYLOAD);
         }
 
-        // Verify JWT signature
+        // Verify JWT signature (proves JWT was issued by the provisioning server).
         const pubKey = await importEd25519PublicKey(pubJwtSigningKey);
         const validJwtSignature = await verifyJwtSignature(jwt, pubKey);
         if (!validJwtSignature)
             throw new Error(UserFacingMessage.INVALID_JWT_SIGNATURE);
 
-        // Verify client's signature
+        // Verify client's per-request signature (binds AuthHash to the client private key).
         if (signatureIfAny) {
             const validClientSignature = await verifyEd25519(clientId, signatureIfAny, authPrefixRaw_33Bytes);
             if (!validClientSignature)
@@ -164,15 +176,15 @@ async function verifyAuthenticationHeader(request) {
 
         //return new Response("OK", { status: 200 }); // useful for testing
 
-        // Everything OK — forward request to backend
-        // Note: accessing this worker on w1.edge-test.workers.dev (and not on your domain) will result with response 404, since w1.edge-test.workers.dev 
-        //   is test URL that doesn't have origin set behind it. In that case 404 can be interpreted as edge validation was successful.
+        // Everything OK — forward request to the backend
+        // Note: accessing this worker on w1.edge-test.workers.dev (and not on your domain) will result in a 404 response, since w1.edge-test.workers.dev
+        //   is a test URL that doesn't have an origin set behind it. In that case 404 can be interpreted as edge validation was successful.
         return fetch(request);
 
     } catch (err) {
         // Catch errors (invalid format, decode issues, etc.)
         const now = Math.floor(Date.now() / 1000);
-        const responseBody = { time: now }; // Always return JSON 'time' so device can update it's internal clock
+        const responseBody = { time: now }; // Always return JSON 'time' so the client can update its internal clock
         if (err?.message)
             responseBody.message = err.message;
         return new Response(
@@ -185,44 +197,72 @@ async function verifyAuthenticationHeader(request) {
     }
 }
 
+/**
+ * Accepts an optionally-compressed JWT representation and returns a standard compact JWS string.
+ * Throws a user-facing error on malformed short format.
+ */
 function fixShortJwt(jwt) {
     // handle short JWT form
     if (jwt.startsWith(".{`")) {
-        //Note: clients that prefer to use shorter URLs (including highly constrained clients that can't compute signature)
-        //      may send shorter version of JWT (JWT header skipped, and JWT payload in unencoded form with " replaced by ` ).
+        // Note: clients that prefer to use shorter URLs (including highly constrained clients that can't compute signature)
+        //       may send a shorter version of the JWT (JWT header skipped, and JWT payload in unencoded form with " replaced by ` ).
+        // Short format of JWT might look like this:  .{`d`:`kL2R-ClientID-v9xgA`,`k`:`abcd`,`c`:`efgh`}.602R-JWT-signature
         
-        // JWT payload we use is shorter in unencoded form, but to use it efficiently we need to avoid URL characters that would be encoded into %XX.
-        //   To make it shorter JWT will not have first part (always the same), and second part will be unencoded, with '"' replaced with '`'.
-        //   For this, provisioning server needs to not sign JWTs with following: ',  %, ., ~, and space, inside JWTs payload.
-        //   Short JWT might looks like this:  .{`d`:`kL2R-DeviceID-v9xgA`,`k`:`abcd`,`c`:`efgh`}.602R-JWT-signature-OrE1
+        // JWT is <header>.<payload>.<signature>
+        //   - header is always "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9" since algorithm doesn't change
+        //   - payload is shorter in unencoded form, but to use it efficiently we need to avoid URL characters that would be encoded into %XX.
+        //       That is why the unencoded payload needs to be sent with '"' replaced by '`'.
+        //       Signed payload must not contain:   '   %   .   ~   <space>.
+        //   - signature is kept as is.
 
-        const jwtPayload = JSON.parse(decodeBase64urlToString(jwt.split(".")[1]));
-        if ( /['"%\.~ ]/.test(jwtPayload) ) // short JWT payload must not contains ', ", %, ., ~, or space.
+        const jwtPayload = jwt.split(".")[1];
+        if ( /['"%\.~ ]/.test(jwtPayload) ) // short JWT payload must not contain ', ", %, ., ~, or space.
             throw new Error(UserFacingMessage.MALFORMED_JWT);
-
         // reconstruct valid JWT
         jwt = 'eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.' + toBase64url(jwtPayload.replace(/`/g, '"')) + '.' + jwt.split(".")[2];
+        
+        // Clients with buffers limited to 256 chars will want to:
+        //     (i) skip signature, (ii) skip JWT's header (iii) skip JWT's "i" claim, and (iv) transmit unencoded JWT payload
 
-        // Clients with buffers limited to 256 char will want to:
-        //     (i) skip signature, (ii) skip JWT's header (always: eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9),
-        //     (iii) skip JWT's "i" claim, and (iv) transmit unencoded JWT payload
+        // If more compression is needed, jwt payload should be replaced with an array of 3 base64url values: [DeviceID,KeyID,ClientType], like this:
+        //   ?uca=YxVoNmLyYBHUweUKdjv1Hc6gWbWevXa5cS1fBxX4XWB3~.[kLvWoK4EMcI2YBNtJ7jSeJ2KuA5WlfIdIVRg2v9xgtA,abcd,efgh].602Rok-signature-Em1TAQ
+        //   Further optimizations are possible by recompressing all base64 strings into custom encoding (base-85 or so, for ~6.4% reduction).
     }
     return jwt;
 }
 
-async function computeAuthHash(jwt, request, timestampSec) {
-    const salt = EdgeState.authEdgeSalt;
+/**
+ * Recomputes AuthHash for the received request.
+ *
+ * Inputs:
+ *   - clientId: used to derive ClientAuthSecret via HMAC-SHA256(BackendDerivationKey, clientId)
+ *   - jwt: bound into the hash (identity binding)
+ *   - request: body/method/url are bound into the hash (integrity binding)
+ *   - timestampSec: candidate timestamp reconstructed from TimeByte (replay window binding)
+ *
+ * Output:
+ *   - 32-byte SHA-256 digest (Uint8Array)
+ */
+async function computeAuthHash(clientId, jwt, request, timestampSec) {
     const url = new URL(request.url);
-    const urlPathWithQuery = url.pathname + url.search; // TODO remove last 'uca' argument
-    const urlForHash = url.host.toLowerCase() + urlPathWithQuery;
+    let urlPathWithQuery = url.pathname + url.search;
+    // Remove the trailing authentication header from the URL if it is added as the last URL parameter.
+    urlPathWithQuery = urlPathWithQuery.replace(new RegExp(`([?&])${REQUEST_PARAM_KEY}=[^&]*$`), ""); // remove trailing ?uca=... or &uca=...
 
+    const urlForHash = url.host.toLowerCase() + urlPathWithQuery;
+    if (/[\r\n]/.test(urlForHash))
+        throw new Error(UserFacingMessage.INVALID_PREFIX_FORMAT);
+    // Derive per-client secret (ClientAuthSecret) deterministically at the edge.
+    const clientAuthSecret = toBase64url(await hmacSha256(EdgeState.backendDerivationKey, clientId));
+
+    // Note: request.arrayBuffer() consumes the body, so pass in request.clone().
     const bodyBuf = new TextDecoder("utf-8").decode(await request.arrayBuffer()); // as text
     const bodyHashRaw = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bodyBuf));
     const bodyHash = uint8ArrayToHex(new Uint8Array(bodyHashRaw));
 
-    // AuthHash = SHA-256(JWT ∥ "\n" ∥ EdgeSalt ∥ "\n" ∥ Timestamp ∥ "\n" ∥ Method ∥ "\n" ∥ BodyHash ∥ "\n" ∥ URL)
-    const stringToHash = `${jwt}\n${salt}\n${String(timestampSec)}\n` +
-                         `${request.method.toUpperCase()}\n${bodyHash}\n${urlForHash}`;
+    // AuthHash = SHA-256( JWT || "\n" || ClientAuthSecret || "\n" || Timestamp || "\n" || Method || "\n" || BodyHash || "\n" || URL || "\n" )
+    const stringToHash = `${jwt}\n${clientAuthSecret}\n${String(timestampSec)}\n` +
+                         `${request.method.toUpperCase()}\n${bodyHash}\n${urlForHash}\n`;
 
     const hash = new Uint8Array(await crypto.subtle.digest(
         "SHA-256",
@@ -231,7 +271,9 @@ async function computeAuthHash(jwt, request, timestampSec) {
     return hash;
 }
 
-// Import Ed25519 public key for WebCrypto.verify
+/**
+ * Imports an Ed25519 public key (SPKI, base64) into WebCrypto so it can be used for signature verification.
+ */
 async function importEd25519PublicKey(base64PubKey) {
     const rawPubKey = Uint8Array.from(atob(base64PubKey), c => c.charCodeAt(0));
     return crypto.subtle.importKey(
@@ -243,6 +285,12 @@ async function importEd25519PublicKey(base64PubKey) {
     );
 }
 
+/**
+ * Verifies an Ed25519 signature from a client.
+ * clientId is the client Ed25519 public key encoded as base64url.
+ * signature is base64url.
+ * dataBytes is the raw bytes that were signed (here: AuthHash||TimeByte prefix).
+ */
 async function verifyEd25519(clientId, signature, dataBytes) {
     const clientPublicKeyRaw = decodeBase64urlToUint8Array(clientId);
     const publicKey = await crypto.subtle.importKey(
@@ -262,7 +310,9 @@ async function verifyEd25519(clientId, signature, dataBytes) {
 }
 
 
-// Splits JWT into header, payload, signature; and verifies signature.
+/**
+ * Splits a JWT into header, payload, and signature, then verifies the signature.
+ */
 async function verifyJwtSignature(token, key) {
     // Split JWT into parts
     const [header64, payload64, signature64] = token.split(".");
@@ -293,15 +343,40 @@ async function verifyJwtSignature(token, key) {
     return valid;
 }
 
+/**
+ * Computes HMAC-SHA256(keyString, dataString) using WebCrypto and returns raw bytes (Uint8Array).
+ */
+async function hmacSha256(keyString, dataString) {
+    const cryptoKey = await crypto.subtle.importKey(
+        "raw",
+        new TextEncoder().encode(keyString),
+        { name: "HMAC", hash: "SHA-256" },
+        false,
+        ["sign"]
+    );
+    const signature = await crypto.subtle.sign(
+        "HMAC",
+        cryptoKey,
+        new TextEncoder().encode(dataString)
+    );
+    return new Uint8Array(signature);
+}
+
+/**
+ * Constant-time (length-equal) byte-array comparison.
+ */
 function isEqualBytes(a, b) {
     if (a.length !== b.length)
         return false;
     let diff = 0;
     for (let i = 0; i < a.length; i++)
-        diff |= a[i] ^ b[i]; // side-channel resistant
+        diff |= a[i] ^ b[i];
     return diff === 0;
 }
 
+/**
+ * Converts a Uint8Array to lowercase hex string.
+ */
 function uint8ArrayToHex(u8) {
     let s = "";
     for (let i = 0; i < u8.length; i++)
@@ -309,7 +384,10 @@ function uint8ArrayToHex(u8) {
     return s;
 }
 
-// Decode base64url to Uint8Array
+/**
+ * Decodes base64url to Uint8Array.
+ * Note: accepts both padded and unpadded base64url.
+ */
 function decodeBase64urlToUint8Array(base64url) {
     let base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
     while (base64.length % 4)
@@ -317,7 +395,10 @@ function decodeBase64urlToUint8Array(base64url) {
     return Uint8Array.from(atob(base64), c => c.charCodeAt(0));
 }
 
-// Decode base64url to string
+/**
+ * Decodes base64url to a UTF-8 string.
+ * Used for JWT header/payload JSON decoding.
+ */
 function decodeBase64urlToString(base64url) {
     let base64 = base64url.replace(/-/g, "+").replace(/_/g, "/");
     while (base64.length % 4)
@@ -325,15 +406,36 @@ function decodeBase64urlToString(base64url) {
     return atob(base64); 
 }
 
-function toBase64url(buffer) {
-    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+
+/**
+ * Encodes input as base64url (no padding).
+ * Supported input types:
+ *   - Uint8Array
+ *   - ArrayBuffer
+ *   - string (encoded as UTF-8 first)
+ */
+function toBase64url(input) {
+    let bytes;
+    if (input instanceof Uint8Array)
+        bytes = input;
+    else if (input instanceof ArrayBuffer)
+        bytes = new Uint8Array(input);
+    else if (typeof input === "string")
+        bytes = new TextEncoder().encode(input);
+    else
+        throw new TypeError("Unsupported input type");
     const binary = String.fromCharCode(...bytes);
     return btoa(binary)
         .replace(/=+$/g, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
 
+/**
+ * Syntactic JWT check:
+ *   - exactly 3 dot-separated parts
+ *   - each part must be base64url characters only (no padding)
+ */
 function isValidJwtFormat(jwt) {
-    // this prevents tricks like adding '=' at the end of base64url encoding, etc.
+    // This prevents tricks like adding '=' at the end of base64url encoding, etc.
     if (typeof jwt !== 'string')
         return false;
     const parts = jwt.split('.');
@@ -342,6 +444,9 @@ function isValidJwtFormat(jwt) {
     return parts.every(part => isValidBase64url(part));
 }
 
+/**
+ * Checks whether a string contains only base64url characters (no padding).
+ */
 function isValidBase64url(str) {
-    return (typeof str === 'string' && /^[A-Za-z0-9_-]*$/.test(str)); // yes, *, not +
+    return (typeof str === 'string' && /^[A-Za-z0-9_-]*$/.test(str));
 }
